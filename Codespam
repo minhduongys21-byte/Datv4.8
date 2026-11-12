@@ -1,0 +1,101 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include "esp_wifi.h"
+
+// ================= THÔNG SỐ CẤU HÌNH =================
+// Tên SSID cố định theo yêu cầu (Hỗ trợ UTF-8 tiếng Việt có dấu)
+const char* targetSSID = "Cá dồ là của anh Kha";
+
+// Cấu hình kênh phát sóng Wi-Fi (Kênh 1)
+#define WIFI_CHANNEL 1
+
+// Số lượng bản ghi phát ra trong mỗi chu kỳ (Mặc định 30 bản ghi theo yêu cầu)
+#define BATCH_COUNT 30
+
+// Cấu trúc khung gói tin Beacon giả mạo chuẩn 802.11
+uint8_t beaconPacket[128] = {
+  0x80, 0x00, 0x00, 0x00,               // Frame Control (Management Frame, Beacon)
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff,   // Receiver Address (Broadcast)
+  0x22, 0x33, 0x44, 0x55, 0x66, 0x77,   // Source Address (MAC giả mạo)
+  0x22, 0x33, 0x44, 0x55, 0x66, 0x77,   // BSSID (Trùng với Source Address)
+  0x00, 0x00,                           // Sequence Control
+  // --- Fixed Parameters (12 bytes) ---
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Timestamp
+  0x64, 0x00,                           // Beacon Interval (100 tu)
+  0x31, 0x04                            // Capability Information
+  // Tag định dạng SSID sẽ được chèn động tại đây
+};
+
+void printHeader() {
+  Serial.println(F("================================"));
+  Serial.println(F("WIFI SSID MULTI GENERATOR"));
+  Serial.println(F("ANH KHA PROJECT"));
+  Serial.println();
+  Serial.print(F("SSID: "));
+  Serial.println(targetSSID);
+  Serial.println(F("STATUS: READY"));
+  Serial.println(F("================================\n"));
+}
+
+void setup() {
+  // Khởi động giao tiếp Serial với baudrate chuẩn
+  Serial.begin(115200);
+  delay(1000);
+
+  // Khởi tạo chế độ Access Point ẩn để phần cứng Wi-Fi sẵn sàng tầng thấp
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("AnhKha_Init", "12345678");
+
+  // Thiết lập kênh phát sóng cố định
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  // Hiển thị giao diện thông tin khởi động trên Serial Monitor
+  printHeader();
+}
+
+void loop() {
+  // Chuẩn bị chuỗi SSID (hỗ trợ độ dài tối đa 32 bytes theo chuẩn Wi-Fi)
+  String ssidStr = String(targetSSID);
+  int ssidLen = ssidStr.length();
+  if (ssidLen > 32) ssidLen = 32;
+
+  // Xây dựng khung dữ liệu Beacon Frame
+  int basePacketSize = 36; // Kích thước phần cứng cơ bản của Beacon Frame
+  
+  // Tag 0: SSID Parameter Set
+  beaconPacket[36] = 0x00;           // Tag ID cho SSID
+  beaconPacket[37] = ssidLen;        // Tag Length
+  
+  // Sao chép từng byte của chuỗi UTF-8 vào khung gói tin
+  for (int j = 0; j < ssidLen; j++) {
+    beaconPacket[38 + j] = ssidStr[j];
+  }
+  int currentPacketSize = basePacketSize + 2 + ssidLen;
+
+  // Các thông số bổ sung bắt buộc (Supported Rates & DS Parameter Set cho Kênh)
+  uint8_t tagExtras[] = {
+    0x01, 0x08, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24, // Supported Rates
+    0x03, 0x01, (uint8_t)WIFI_CHANNEL                           // DS Parameter (Channel)
+  };
+
+  for (size_t k = 0; k < sizeof(tagExtras); k++) {
+    beaconPacket[currentPacketSize++] = tagExtras[k];
+  }
+
+  // Vòng lặp tạo hàng loạt bản ghi SSID và phát beacon ra không khí
+  for (int i = 1; i <= BATCH_COUNT; i++) {
+    // Hiển thị kết quả định dạng trên Serial Monitor theo yêu cầu
+    Serial.printf("[%03d] %s\n", i, targetSSID);
+
+    // Gửi gói tin beacon liên tục để các thiết bị xung quanh quét thấy
+    for (int t = 0; t < 3; t++) {
+      esp_wifi_80211_tx(WIFI_IF_AP, beaconPacket, currentPacketSize, false);
+      delayMicroseconds(500); // Khoảng cách nhỏ giữa các gói tin bùng nổ (burst)
+    }
+  }
+
+  Serial.println(F("\n[INFO] Đã hoàn tất một chu kỳ phát. Đang lặp lại...\n"));
+  
+  // Độ trễ ngắn giữa các đợt phát hàng loạt để tránh nghẽn CPU và chống treo máy
+  delay(1000);
+}
